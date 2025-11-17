@@ -1,0 +1,321 @@
+package gol
+
+import (
+	"fmt"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+
+	"uk.ac.bris.cs/gameoflife/util"
+)
+
+type distributorChannels struct {
+	events     chan<- Event
+	ioCommand  chan<- ioCommand
+	ioIdle     <-chan bool
+	ioFilename chan<- string
+	ioOutput   chan<- uint8
+	ioInput    <-chan uint8
+}
+
+func countAlive(world [][]byte) int {
+	count := 0
+	for y := range world {
+		for x := range world[y] {
+			if world[y][x] == 255 {
+				count++
+			}
+		}
+	}
+
+	return count
+}
+
+// distributor divides the work between workers and interacts with other goroutines.
+func distributor(p Params, c distributorChannels, keypress <-chan rune) {
+
+	// TODO: Create a 2D slice to store the world.
+
+	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
+	c.ioCommand <- ioInput
+	c.ioFilename <- filename
+
+	world := make([][]byte, p.ImageHeight)
+	for y := 0; y < p.ImageHeight; y++ {
+		world[y] = make([]byte, p.ImageWidth)
+		for x := 0; x < p.ImageWidth; x++ {
+			world[y][x] = <-c.ioInput
+		}
+	}
+
+	client, err := rpc.Dial("tcp", "127.0.0.1:8040") // your AWS public IP + port
+	if err != nil {
+		fmt.Println("Error connecting to broker:", err)
+		return
+	}
+
+	defer client.Close()
+
+	var worldMutex sync.RWMutex
+	var turnMu sync.RWMutex
+
+	turn := 0
+
+	// Start ticker to report alive cells every 2 seconds
+	ticker := time.NewTicker(2 * time.Second)
+	//Channel used to sognal the goroutine to stop
+	done := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			// Case runs every time the timer ticks (every 2 seconds)
+			case <-ticker.C:
+
+				worldMutex.RLock()
+				turnMu.RLock()
+				currentTurn := turn
+				totalAlive := countAlive(world)
+				worldMutex.RUnlock()
+				turnMu.RUnlock()
+
+				c.events <- AliveCellsCount{
+					CompletedTurns: currentTurn,
+					CellsCount:     totalAlive,
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// calculates which cells are alive in the inital state before a turn has been made
+	initialAlive := AliveCells(world, p.ImageWidth, p.ImageHeight)
+	if len(initialAlive) > 0 {
+		c.events <- CellsFlipped{
+			CompletedTurns: 0,
+			Cells:          initialAlive}
+	}
+
+	c.events <- StateChange{turn, Executing}
+
+	// for each turn it needs to split up the jobs,
+	// such that there is one job from eahc section for each thread
+	// needs to gather the results and then put them together for the newstate of world
+	// TODO: Execute all turns of the Game of Life.
+
+	//----------------------------------------------------------------------------------------------------------//
+	//----------------------------------------------------------------------------------------------------------//
+
+	// variables for step 5
+	paused := false
+	quitting := false
+
+	for {
+		select {
+		case key := <-keypress:
+			switch key {
+			case 'p':
+				if !paused {
+					paused = true
+
+					turnMu.RLock()
+					currentTurn := turn
+					turnMu.RUnlock()
+
+					fmt.Println("paused at turn:", currentTurn)
+					c.events <- StateChange{currentTurn, Paused}
+				} else {
+					paused = false
+
+					turnMu.RLock()
+					currentTurn := turn
+					turnMu.RUnlock()
+
+					fmt.Println("continuing")
+					c.events <- StateChange{currentTurn, Executing}
+				}
+			case 's':
+				worldMutex.RLock()
+				turnMu.RLock()
+				saveImage(p, c, world, turn)
+				turnMu.RUnlock()
+				worldMutex.RUnlock()
+			case 'q':
+				worldMutex.RLock()
+				turnMu.RLock()
+				saveImage(p, c, world, turn)
+				turnMu.RUnlock()
+				worldMutex.RUnlock()
+
+				client.Call("Broker.ControllerExit", Empty{}, &Empty{})
+				done <- true
+				ticker.Stop()
+
+				c.events <- StateChange{turn, Quitting}
+				fmt.Println("quitting, sending signal to worker")
+				close(c.events)
+				return
+
+			case 'k':
+				worldMutex.RLock()
+				turnMu.RLock()
+				saveImage(p, c, world, turn)
+				turnMu.RUnlock()
+				worldMutex.RUnlock()
+
+				client.Call("Broker.KillWorkers", Empty{}, &Empty{})
+				done <- true
+				ticker.Stop()
+
+				turnMu.RLock()
+				currentTurn := turn
+				turnMu.RUnlock()
+
+				c.events <- StateChange{currentTurn, Quitting}
+				close(c.events)
+				fmt.Println("shutting down full system")
+				os.Exit(0)
+
+			}
+			continue
+		default:
+		}
+
+		turnMu.RLock()
+		doneTurns := turn
+		turnMu.RUnlock()
+
+		// quit if acc finished and not paused
+		if quitting || (doneTurns >= p.Turns && !paused) {
+			break
+		}
+
+		if paused {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		worldMutex.RLock()
+		currentWorld := world
+		worldMutex.RUnlock()
+
+		request := BrokerRequest{
+			Params: p,
+			World:  currentWorld,
+		}
+
+		var response BrokerResponse
+
+		err = client.Call("Broker.ProcessSection", request, &response)
+		if err != nil {
+			fmt.Println("Error calling broker.ProcessSection:", err)
+			quitting = true
+			continue
+		}
+
+		///// STEP 6 CELLS FLIPPED///////////
+		// At the end of each turn, put all changed coordinates into a slice,
+		// and then send CellsFlipped event
+		// make a slice so as to compare the old row and the new row of the world
+		flippedCells := make([]util.Cell, 0)
+		// go row by row, then column by column
+		for y := 0; y < p.ImageHeight; y++ {
+			for x := 0; x < p.ImageWidth; x++ {
+				if world[y][x] != response.World[y][x] {
+					flippedCells = append(flippedCells, util.Cell{X: x, Y: y})
+				}
+			}
+		}
+
+		// if there is at least one cell thats been flipped then we need to return the
+		// Cells Flipped event
+		if len(flippedCells) > 0 {
+			turnMu.RLock()
+			currentTurn := turn + 1
+			turnMu.RUnlock()
+			c.events <- CellsFlipped{
+				CompletedTurns: currentTurn,
+				Cells:          flippedCells}
+		}
+
+		worldMutex.Lock()
+		world = response.World
+		worldMutex.Unlock()
+
+		///// STEP 6 TURN COMPLETE///////////
+		// At the end of each turn we need to signal that a turn is completed
+		turnMu.Lock()
+		turn++
+		currentTurn := turn
+		turnMu.Unlock()
+
+		c.events <- TurnComplete{
+			CompletedTurns: currentTurn,
+		}
+	}
+
+	//Stop ticker after finishing all turns
+	done <- true
+	ticker.Stop()
+
+	// TODO: Report the final state using FinalTurnCompleteEvent.
+	worldMutex.RLock()
+	aliveCells := AliveCells(world, p.ImageWidth, p.ImageHeight)
+	worldMutex.RUnlock()
+
+	turnMu.RLock()
+	finalTurn := turn
+	turnMu.RUnlock()
+
+	c.events <- FinalTurnComplete{CompletedTurns: finalTurn, Alive: aliveCells}
+
+	//save final output
+	worldMutex.RLock()
+	saveImage(p, c, world, finalTurn)
+	worldMutex.RUnlock()
+
+	c.events <- StateChange{finalTurn, Quitting}
+
+	//Close the channels to stop the SDL goroutine gracefully. Removing may cause deadlock.
+	close(c.events)
+
+}
+
+func AliveCells(world [][]byte, width, height int) []util.Cell {
+	cells := make([]util.Cell, 0)
+	for dy := 0; dy < height; dy++ {
+		for dx := 0; dx < width; dx++ {
+			if world[dy][dx] == 255 {
+				cells = append(cells, util.Cell{X: dx, Y: dy})
+			}
+		}
+	}
+	return cells
+}
+
+// helper function to handle image saves
+func saveImage(p Params, c distributorChannels, world [][]byte, turn int) {
+	// Write final world to output file (PGM)
+	// Construct the output filename in the required format
+	// Example: "512x512x100" for a 512x512 world after 100 turns
+	outFileName := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
+	c.ioCommand <- ioOutput     // telling the i/o goroutine that we are starting an output operation
+	c.ioFilename <- outFileName // sending the filename to io goroutine
+
+	for y := 0; y < p.ImageHeight; y++ {
+		for x := 0; x < p.ImageWidth; x++ {
+			//writing the pixel value to the ioOutput channel
+			c.ioOutput <- world[y][x] //grayscale value for that pixel (0 or 255)
+		}
+	}
+
+	// Make sure that the Io has finished any output before exiting.
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	// once saved, notify the SDL event system (important for Step 5)
+	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: outFileName}
+
+}
