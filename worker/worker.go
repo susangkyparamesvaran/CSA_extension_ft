@@ -9,17 +9,76 @@ import (
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
-type GOLWorker struct{}
+type GOLWorker struct {
+}
+
+// structs for our channels used to communicate with the worker goroutine
+type threadJob struct {
+	startY int
+	endY   int
+	world  [][]byte
+}
+
+type threadResult struct {
+	ID           int
+	startY       int
+	worldSection [][]byte
+}
+
+type section struct {
+	start int
+	end   int
+}
 
 // process the section the broker gives
 func (e *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionResponse) error {
 	p := req.Params
 	world := req.World
+
 	startY := req.StartY
 	endY := req.EndY
 
-	// call calculate state function on the requested section
-	updatedSection := calculateNextStates(p, world, startY, endY)
+	rows := endY - startY
+
+	// channels to send work and recieve work in parallel
+	jobChan := make(chan threadJob)
+	resultChan := make(chan threadResult, p.Threads)
+
+	// split the rows assigned to a worker between the threads
+	threadSections := assignRows(rows, p.Threads)
+
+	// call goroutine to work on each row
+	for i := 0; i < p.Threads; i++ {
+		go processThread(i, p, jobChan, resultChan)
+	}
+
+	// build correct section of world that the worker was supposed to process
+	// return said section
+	for _, job := range threadSections {
+		jobChan <- threadJob{
+			// relative to node's section of rows
+			startY: job.start + startY,
+			endY:   job.end + startY,
+			world:  world,
+		}
+	}
+	close(jobChan)
+
+	// collect all the resuts and put them into the new state of world
+	results := make([]threadResult, 0, len(threadSections))
+	for i := 0; i < len(threadSections); i++ {
+		results = append(results, <-resultChan)
+	}
+	close(resultChan)
+
+	// build correct new section of world
+	updatedSection := make([][]byte, rows)
+	for _, result := range results {
+		offset := result.startY - startY
+		for i, row := range result.worldSection {
+			updatedSection[offset+i] = row
+		}
+	}
 
 	// update response to give back to broker
 	res.StartY = startY
@@ -144,3 +203,47 @@ func main() {
 	}
 }
 
+// helper function, calls calculateNextState on each section the thread is working on
+func processThread(id int, p gol.Params, jobs <-chan threadJob, results chan<- threadResult) {
+	for job := range jobs {
+		outputSection := calculateNextStates(p, job.world, job.startY, job.endY)
+		results <- threadResult{
+			ID:           id,
+			startY:       job.startY,
+			worldSection: outputSection,
+		}
+	}
+}
+
+// helper function to split rows between threads for one worker
+func assignRows(height, threads int) []section {
+	// say if we had 16 rows and 4 threads
+	// we want to be able to allocate say 4 rows to 1 thread, 4 to the other thread etc.
+
+	// we need to calculate the minimum number of rows for each worker
+	minRows := height / threads
+	// then say if we have extra rows left over then we need to assign those evenly to each worker
+	extraRows := height % threads
+
+	// make a slice, the size of the number of threads
+	sections := make([]section, threads)
+	start := 0
+
+	for i := 0; i < threads; i++ {
+		// assigns the base amount of rows to the thread
+		rows := minRows
+		// if say we're on worker 2 and there are 3 extra rows left,
+		// then we can add 1 more job to the thread
+		if i < extraRows {
+			rows++
+		}
+
+		// marks where the end of the section ends
+		end := start + rows
+		// assigns these rows to the section
+		sections[i] = section{start: start, end: end}
+		// start is updated for the next worker
+		start = end
+	}
+	return sections
+}

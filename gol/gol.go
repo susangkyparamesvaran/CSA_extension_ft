@@ -72,4 +72,3 @@ func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
 	distributor(p, distributorChannels, keyPresses)
 
 }
-

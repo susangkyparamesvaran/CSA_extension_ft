@@ -60,19 +60,18 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 	var worldMutex sync.RWMutex
 	var turnMu sync.RWMutex
 
-	turn := 0
-
 	// Start ticker to report alive cells every 2 seconds
 	ticker := time.NewTicker(2 * time.Second)
 	//Channel used to sognal the goroutine to stop
 	done := make(chan bool)
+
+	turn := 0
 
 	go func() {
 		for {
 			select {
 			// Case runs every time the timer ticks (every 2 seconds)
 			case <-ticker.C:
-
 				worldMutex.RLock()
 				turnMu.RLock()
 				currentTurn := turn
